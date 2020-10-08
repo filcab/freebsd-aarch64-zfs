@@ -1,0 +1,320 @@
+#!/bin/sh
+
+set -e
+
+# Assume:
+# xhyve (or whatever) running with 2 virtual devices:
+#  - original FreeBSD image for RPiX
+#  - img or passthrough device for installation
+
+# gpart img/passthrough with
+#  - bootcode (RPi files + Bootloader)
+#  - ZFS partition
+
+# Roughly follows the partition commands from https://wiki.freebsd.org/RootOnZFS/GPTZFSBoot
+
+# default to dry-run
+DRY_RUN=yes
+verb=echo
+TEMPLABEL=`basename $0`
+PARTITION_TYPE=mbr
+
+usage() {
+  echo "usage: $0 [-g] [-i] [-f] source-rpi-image destination-image-or-disk"
+  echo
+  echo "  -f	Actually run the commands (default is dry-run)"
+  echo "  -g	Use GPT instead of MBR for the output disk"
+  echo "  -i	Destination is a non-existent image file (create an md device and use that)"
+  echo "  -h hostname	Change rc.conf to use the provided hostname"
+  if [ ! -z "$1" ]; then
+    exit 1
+  fi
+}
+
+run_with_echo() {
+  echo "$@"
+  "$@"
+}
+
+SET_HOSTNAME=no
+args=`getopt figh: $*`
+if [  $? -ne 0 ]; then
+  usage fail
+fi
+set -- $args
+while :; do
+  case "$1" in
+    -f)
+      verb=run_with_echo
+      DRY_RUN=
+      shift
+      ;;
+    -g)
+      PARTITION_TYPE=gpt
+      shift
+      ;;
+    -h)
+      HOSTNAME="$2"
+      SET_HOSTNAME=yes
+      shift
+      shift
+      ;;
+    -i)
+      DST_IS_IMAGE=yes
+      shift
+      ;;
+    --)
+      shift; break
+      ;;
+  esac
+done
+
+if [ $# -ne 2 ]; then
+  usage fail
+fi
+
+SRC="$1"
+DST="$2"
+
+if [ "$verb" != "echo" ]; then
+  echo WARNING: This will erase $DST
+  read -p "Press ENTER to continue..." dummy
+fi
+
+echo Using source image ${SRC}
+
+if [ "$DST_IS_IMAGE" == "yes" ]; then
+  if [ -e "$DST" ]; then
+    echo error: ${DST} must not exist when creating images
+    usage fail
+  fi
+
+  # default to 3GB
+  IMG_SIZE=$((3000000000))
+  # MD related stuff lifted from crochet
+  SIZE_DISPLAY="$(($IMG_SIZE / 1000000))MB"
+  echo "Creating a ${SIZE_DISPLAY} raw disk image in:"
+  echo "    $DST"
+  # Interesting ftruncate like
+  $verb dd if=/dev/zero of=${DST} bs=1000000 seek=$(($IMG_SIZE / 1000000)) count=0 >/dev/null 2>&1
+  if [ "$DRY_RUN" != "yes" ]; then
+    DISK_MD=`mdconfig -a -t vnode -f ${DST} -x 63 -y 255`
+    $verb trap "mdconfig -d -u  ${DISK_MD}" EXIT
+  else
+    echo mdconfig -a -t vnode -f ${DST} -x 63 -y 255
+    DISK_MD=ZZZ_FAKE_disk_md
+  fi
+  DST=${DISK_MD}
+fi
+
+echo Writing to ${DST}
+if [ "$verb" != "echo" ]; then
+  read -p "Please double-check everything. Press ENTER to continue..." dummy
+fi
+
+do_cleanup() {
+  echo Cleaning up possible remnants
+  # make sure we don't exit due to set -e
+  for i in /dev/${DST}s?; do
+    $verb gpart destroy -f x -F ${i} 2>/dev/null || true
+  done
+  $verb gpart destroy -f x -F ${DST} 2>/dev/null || true
+  $verb gpart commit ${DST}
+}
+
+do_partitioning() {
+  case "$PARTITION_TYPE" in
+    gpt|GPT)
+      ;;
+    mbr|MBR)
+      ;;
+    *)
+      echo error: invalid partition type: $PARTITION_TYPE
+      exit 1
+  esac
+
+  $verb gpart create -f x -s $PARTITION_TYPE $DST
+
+  #local fat_type='!12'
+  local fat_type='fat16'
+  local fat_grep='fat'
+  if [ "$PARTITION_TYPE" == "gpt" ]; then
+    fat_type=ms-basic-data
+    fat_grep=ms-basic-data
+  fi
+
+  # Use the same size as the freebsd images
+  # TODO: Just get the size from the image
+  # Use the same -t as crochet for RPi3
+  $verb gpart add -f x -a 4k -s 50M -t "$fat_type" $DST
+  if [ "$DRY_RUN" != "yes" ]; then
+    PART_DST_BOOT=$(gpart show -p $DST | awk "/$fat_grep/"' { print $3; }')
+    PART_DST_BOOT_INDEX=$(gpart show ${DST} | awk "/$fat_grep/"' { print $3; }')
+  fi
+
+  if [ "$PARTITION_TYPE" == "mbr" ]; then
+    # Set the active partition for booting (not needed in GPT)
+    $verb gpart set -f x -a active -i ${PART_DST_BOOT_INDEX} ${DST}
+
+    # Ref: https://wiki.freebsd.org/RootOnZFS/ZFSBootSlice
+    # Create a freebsd slice and create zfs inside it (not needed for GPT)
+    $verb gpart add -f x -a 512k -t freebsd ${DST}
+    if [ "$DRY_RUN" != "yes" ]; then
+      PART_DST_BSD_SLICE=$(gpart show -p $DST | awk '/freebsd/ { print $3; }')
+    else
+      PART_DST_BSD_SLICE=ZZZ_FAKE_bsd_slice
+    fi
+    $verb gpart create -f x -s BSD ${PART_DST_BSD_SLICE}
+  else
+    # For GPT just create the ZFS partition at top-level
+    PART_DST_BSD_SLICE="$DST"
+  fi
+
+
+  # Fill the rest of the drive
+  $verb gpart add -f x -t freebsd-zfs ${PART_DST_BSD_SLICE}
+  if [ "$DRY_RUN" != "yes" ]; then
+    PART_DST_ZFS=$(gpart show -p ${PART_DST_BSD_SLICE} | awk '/freebsd-zfs/ { print $3; }')
+  fi
+
+  $verb gpart commit $DST
+  $verb gpart show $DST
+  $verb gpart status $DST
+}
+
+do_mkfs() {
+  # FAT16 is enough for our 50MiB partition
+  $verb newfs_msdos -L MSDOSBOOT -F 16 $PART_DST_BOOT
+
+  # Deal with ZFS:
+  $verb zpool create -f -o altroot=$DST_ZFS zroot $PART_DST_ZFS
+  # Default to using lz4, as it's plenty fast and will save some space
+  $verb zfs set compress=on zroot
+
+  # Create boot environment hierarchy
+  $verb zfs create -o mountpoint=none zroot/ROOT
+  $verb zfs create -o mountpoint=/ -o canmount=noauto zroot/ROOT/default
+
+  # Create the datasets
+  $verb zfs create -o mountpoint=/tmp  -o exec=on      -o setuid=off   zroot/tmp
+  $verb zfs create -o mountpoint=/usr  -o canmount=off                 zroot/usr
+  $verb zfs create                                                     zroot/usr/home
+  $verb zfs create                     -o exec=off     -o setuid=off   zroot/usr/src
+  $verb zfs create                                                     zroot/usr/obj
+  $verb zfs create -o mountpoint=/usr/ports            -o setuid=off   zroot/usr/ports
+  $verb zfs create                     -o exec=off     -o setuid=off   zroot/usr/ports/distfiles
+  $verb zfs create                     -o exec=off     -o setuid=off   zroot/usr/ports/packages
+  $verb zfs create -o mountpoint=/var  -o canmount=off                 zroot/var
+  $verb zfs create                     -o exec=off     -o setuid=off   zroot/var/audit
+  $verb zfs create                     -o exec=off     -o setuid=off   zroot/var/crash
+  $verb zfs create                     -o exec=off     -o setuid=off   zroot/var/log
+  $verb zfs create -o atime=on         -o exec=off     -o setuid=off   zroot/var/mail
+  $verb zfs create                     -o exec=on      -o setuid=off   zroot/var/tmp
+
+  # symlinks and permissions
+  $verb ln -s /usr/home $DST_ZFS/home
+  $verb chmod 1777 $DST_ZFS/var/tmp
+  $verb chmod 1777 $DST_ZFS/tmp
+}
+
+do_mount() {
+  if [ "$DRY_RUN" != "yes" ]; then
+    PART_SRC_FAT=$($verb gpart show -p $SRC | awk '/fat/ { print $3; }')
+    PART_SRC_UFS=$($verb gpart show -p $SRC | awk '/freebsd-ufs/ { print $3; }')
+
+    if [ -z "$PART_SRC_UFS" ]; then
+      # We probably have a slice... let's go in
+      PART_SRC_UFS=$($verb gpart show -p $SRC | awk '/freebsd/ { print $3; }')
+      PART_SRC_UFS=$($verb gpart show -p $PART_SRC_UFS | awk '/freebsd-ufs/ { print $3; }')
+    fi
+
+    # It seems we need to specify the type, otherwise we hit an error
+    $verb mount -t msdosfs /dev/$PART_SRC_FAT $SRC_FAT
+    $verb mount /dev/$PART_SRC_UFS $SRC_UFS
+
+    $verb mount -t msdosfs /dev/$PART_DST_BOOT $DST_FAT
+    $verb mount -t zfs zroot/ROOT/default $DST_ZFS
+  fi
+}
+
+do_filecopy() {
+  if [ "$DRY_RUN" != "yes" ]; then
+    echo Copying from $SRC_FAT to $DST_FAT
+    (cd $SRC_FAT && tar cjf - *) | (cd $DST_FAT && tar xjf -)
+    echo Copying from $SRC_UFS to $DST_ZFS
+    # Use * to glob all the files. Otherwise we'll try to set the time at the root and it won't work
+    (cd $SRC_UFS && tar cjf - .) | (cd $DST_ZFS && tar xjf -)
+  else
+    echo Skipping copy phase
+  fi
+}
+
+do_final_adjustments() {
+  # setup boot environment
+  $verb zpool set bootfs=zroot/ROOT/default zroot
+
+  echo 'echo opensolaris_load="YES"	>> $DST_ZFS/boot/loader.conf'
+  #echo 'echo cryptodev_load="YES"	>> $DST_ZFS/boot/loader.conf'
+  echo 'echo zfs_load="YES"		>> $DST_ZFS/boot/loader.conf'
+  echo 'echo geom_label_load="YES"	>> $DST_ZFS/boot/loader.conf'
+
+  if [ "$DRY_RUN" != "yes" ]; then
+    echo 'opensolaris_load="YES"'	>> $DST_ZFS/boot/loader.conf
+    #echo 'cryptodev_load="YES"'	>> $DST_ZFS/boot/loader.conf
+    echo 'zfs_load="YES"'		>> $DST_ZFS/boot/loader.conf
+
+    # Make sure we can find our MSDOSBOOT labelledpartition
+    echo 'geom_label_load="YES"'	>> $DST_ZFS/boot/loader.conf
+
+    # Also fix umodem.ko
+    echo 'ucom_load="YES"'		>> $DST_ZFS/boot/loader.conf
+    echo 'usb_load="YES"'		>> $DST_ZFS/boot/loader.conf
+
+    # Set our boot filesystem override (system was compiled to boot from UFS)
+    echo 'vfs.root.mountfrom="zfs:zroot/ROOT/default"'	>> $DST_ZFS/boot/loader.conf
+  fi
+
+  # Enable the menu (disabled by default on RPi for some reason)
+  # $verb sed -i '' \
+  #   -e '/Disable the beastie menu/d' \
+  #   -e '/beastie_disable="YES"/d'    \
+  #   $DST_ZFS/boot/loader.conf
+
+  # Fix fstab:
+  #  Remove the UFS partition line
+  #  Make mdsosfs partition noauto (right now we need to issue a glabel refresh <partition> to make it show up)
+  $verb sed -i '' -e '/ufs/d' -e 's/noatime/noatime,noauto/' $DST_ZFS/etc/fstab
+
+  # Don't change any default rc.conf. Use the .local variant
+  $verb sysrc -f $DST_ZFS/etc/rc.conf.local zfs_enable="YES"
+  if [ "$SET_HOSTNAME" == "yes" ]; then
+    $verb sysrc -f $DST_ZFS/etc/rc.conf.local hostname="$HOSTNAME"
+  fi
+}
+
+do_umount() {
+  $verb umount $SRC_UFS $SRC_FAT $DST_FAT
+  $verb zpool export zroot
+}
+
+WORK_DIR=`mktemp -d -t ${TEMPLABEL}` || exit 1
+echo WORK_DIR=$WORK_DIR
+SRC_FAT=$WORK_DIR/src_fat
+SRC_UFS=$WORK_DIR/src_ufs
+DST_FAT=$WORK_DIR/dst_fat
+DST_ZFS=$WORK_DIR/dst_zfs
+if [ "$DRY_RUN" != "yes" ]; then
+  mkdir -v -p $SRC_FAT $SRC_UFS $DST_FAT $DST_ZFS
+else
+  echo mkdir -v -p $SRC_FAT $SRC_UFS $DST_FAT $DST_ZFS
+fi
+
+if [ "${DST_IS_IMAGE}" != "yes" ]; then
+  do_cleanup
+fi
+do_partitioning
+do_mkfs
+do_mount
+do_filecopy
+do_final_adjustments
+do_umount
