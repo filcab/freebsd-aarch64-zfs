@@ -1,0 +1,352 @@
+#!/bin/sh
+
+set -e
+
+DISTSITE_STABLE="https://download.freebsd.org/ftp/releases/arm64/aarch64/12.1-RELEASE/"
+DISTSITE_TESTING="https://download.freebsd.org/ftp/releases/arm64/aarch64/12.2-PRERELEASE/"
+DISTSITE_CURRENT="https://download.freebsd.org/ftp/releases/arm64/aarch64/13.0-CURRENT"
+
+# defaults for CLI options
+BOARD=
+CREATE_IMAGE=no
+DRY_RUN=yes
+HOSTNAME=
+INTERACTIVE=no
+SUDO=
+VERB=echo
+WORK_DIR=work
+ZPOOL=rpizroot
+
+# TODO: RPi3 handling
+RPI3_EFI_URL="https://github.com/pftf/RPi3/releases/download/v1.30/RPi3_UEFI_Firmware_v1.30.zip"
+RPI4_EFI_URL="https://github.com/pftf/RPi4/releases/download/v1.20/RPi4_UEFI_Firmware_v1.20.zip"
+
+run_with_echo() {
+  echo "$@"
+  "$@"
+}
+
+usage() {
+  echo "usage: $0 [OPTIONS] destination-image-or-disk"
+  echo
+  echo "Install FreeBSD-CURRENT for RaspberryPi[34] to a disk or disk image"
+  echo
+  echo "  -h		Show this usage text"
+  echo
+  echo "One and only one of these options must be passed:"
+  echo "  -3		Install for RPi3 (not done yet)"
+  echo "  -4		Install for RPi4"
+  echo
+  echo "Other options"
+  echo "  -H NAME	Set hostname to NAME in rc.conf.local"
+  echo "  -I		Ask additional questions interactively (hostname, users, time, services)"
+  echo "  -S		Use \`sudo' with commands that are likely to require it"
+  echo "  -f		Actually run the commands (default is to just echo)"
+  echo "  -i		Create an image file at destination"
+  echo "  -p NAME   Use NAME as the zpool name (defaults to $ZPOOL)"
+  echo "  -w WORK	Use WORK as a work directory (defaults to $WORK_DIR)"
+  if [ ! -z "$1" ]; then
+    exit 1
+  else
+    exit 0
+  fi
+}
+
+do_cleanup() {
+  echo Cleaning up possible remnants
+  # make sure we don't exit due to set -e
+  for i in /dev/${DST}s?; do
+    $VERB $SUDO gpart destroy -f x -F ${i} 2>/dev/null || true
+  done
+  $VERB $SUDO gpart destroy -f x -F ${DST} 2>/dev/null || true
+  $VERB $SUDO gpart commit ${DST}
+}
+
+do_partitioning() {
+  case "$PARTITION_TYPE" in
+    gpt|GPT)
+      PARTITION_TYPE=gpt
+      ;;
+    mbr|MBR)
+      PARTITION_TYPE=mbr
+      ;;
+    *)
+      echo error: invalid partition type: $PARTITION_TYPE
+      exit 1
+  esac
+
+  $VERB $SUDO gpart create -f x -s $PARTITION_TYPE "$DST"
+
+  local fat_type='fat16'
+  local fat_grep='fat'
+  if [ "$PARTITION_TYPE" == "gpt" ]; then
+    fat_type=efi
+    fat_grep=efi
+  fi
+
+  # Use the same size as the freebsd images
+  # TODO: Just get the size from the image
+  # Use the same -t as crochet for RPi3
+  $VERB $SUDO gpart add -f x -a 4k -s 50M -t "$fat_type" -l "$FAT_LABEL" $DST
+  if [ "$DRY_RUN" == "no" ]; then
+    PART_DST_BOOT=$(gpart show -p $DST | awk "/$fat_grep/"' { print $3; }')
+    PART_DST_BOOT_INDEX=$(gpart show ${DST} | awk "/$fat_grep/"' { print $3; }')
+  fi
+
+  if [ "$PARTITION_TYPE" == "mbr" ]; then
+    # Set the active partition for booting (not needed in GPT)
+    $VERB $SUDO gpart set -f x -a active -i ${PART_DST_BOOT_INDEX} ${DST}
+
+    # Ref: https://wiki.freebsd.org/RootOnZFS/ZFSBootSlice
+    # Create a freebsd slice and create zfs inside it (not needed for GPT)
+    # Not using labels for mbr-based images (TODO: check if it works or at
+    # least they're ignored)
+    $VERB $SUDO gpart add -f x -a 512k -t freebsd ${DST}
+    if [ "$DRY_RUN" == "no" ]; then
+      PART_DST_BSD_SLICE=$(gpart show -p $DST | awk '/freebsd/ { print $3; }')
+    else
+      PART_DST_BSD_SLICE=ZZZ_dry_run_bsd_slice
+    fi
+    $VERB $SUDO gpart create -f x -s BSD ${PART_DST_BSD_SLICE}
+  else
+    # For GPT just create the ZFS partition at top-level
+    PART_DST_BSD_SLICE="$DST"
+  fi
+
+  # Fill the rest of the drive
+  $VERB $SUDO gpart add -f x -t freebsd-zfs -l "$ZPOOL" ${PART_DST_BSD_SLICE}
+  if [ "$DRY_RUN" == "no" ]; then
+    PART_DST_ZFS=$(gpart show -p ${PART_DST_BSD_SLICE} | awk '/freebsd-zfs/ { print $3; }')
+  fi
+
+  $VERB $SUDO gpart commit $DST
+  $VERB gpart show $DST
+  $VERB gpart status $DST
+}
+
+do_mkfs() {
+  # FAT16 is enough for our 50MiB partition
+  # -c 1 is there to allow us to create a very small FAT32 partition
+  $VERB $SUDO newfs_msdos -c 1 -L "$FAT_LABEL" -F "$FAT_BITS" $PART_DST_BOOT
+
+  # Deal with ZFS:
+  $VERB $SUDO zpool create -f -o altroot="$WORK_ROOT" "$ZPOOL" $PART_DST_ZFS
+  CLEANUP_ZFS_EXPORT=yes
+
+  # Default to using lz4, as it's plenty fast and will save some space
+  $VERB $SUDO zfs set compress=on "$ZPOOL"
+
+  # Create boot environment hierarchy
+  $VERB $SUDO zfs create -o mountpoint=none "$ZPOOL"/ROOT
+  $VERB $SUDO zfs create -o mountpoint=/ -o canmount=noauto "$ZPOOL"/ROOT/default
+
+  # Create the datasets
+  $VERB $SUDO zfs create -o mountpoint=/tmp  -o exec=on      -o setuid=off   "$ZPOOL"/tmp
+  $VERB $SUDO zfs create -o mountpoint=/usr  -o canmount=off                 "$ZPOOL"/usr
+  $VERB $SUDO zfs create                                                     "$ZPOOL"/usr/home
+  $VERB $SUDO zfs create                     -o exec=off     -o setuid=off   "$ZPOOL"/usr/src
+  $VERB $SUDO zfs create                                                     "$ZPOOL"/usr/obj
+  $VERB $SUDO zfs create -o mountpoint=/usr/ports            -o setuid=off   "$ZPOOL"/usr/ports
+  $VERB $SUDO zfs create                     -o exec=off     -o setuid=off   "$ZPOOL"/usr/ports/distfiles
+  $VERB $SUDO zfs create                     -o exec=off     -o setuid=off   "$ZPOOL"/usr/ports/packages
+  $VERB $SUDO zfs create -o mountpoint=/var  -o canmount=off                 "$ZPOOL"/var
+  $VERB $SUDO zfs create                     -o exec=off     -o setuid=off   "$ZPOOL"/var/audit
+  $VERB $SUDO zfs create                     -o exec=off     -o setuid=off   "$ZPOOL"/var/crash
+  $VERB $SUDO zfs create                     -o exec=off     -o setuid=off   "$ZPOOL"/var/log
+  $VERB $SUDO zfs create -o atime=on         -o exec=off     -o setuid=off   "$ZPOOL"/var/mail
+  $VERB $SUDO zfs create                     -o exec=on      -o setuid=off   "$ZPOOL"/var/tmp
+
+  # symlinks and permissions
+  $VERB $SUDO ln -fs /usr/home "$WORK_ROOT"/home
+  $VERB $SUDO chmod 1777 "$WORK_ROOT"/var/tmp
+  $VERB $SUDO chmod 1777 "$WORK_ROOT"/tmp
+}
+
+do_mount() {
+  if [ "$DRY_RUN" == "no" ]; then
+    $VERB $SUDO mount -t zfs $ZPOOL/ROOT/default "$WORK_ROOT"
+    $VERB mkdir -p "$WORK_ROOT/boot/efi"
+    $VERB $SUDO mount -t msdosfs /dev/$PART_DST_BOOT "$WORK_ROOT/boot/efi"
+    CLEANUP_UNMOUNT_EFI=yes
+  fi
+}
+
+do_install() {
+  (
+    $VERB export BSDINSTALL_CHROOT="$WORK_ROOT"
+    $VERB export BSDINSTALL_DISTDIR="$WORK_DIR/dist"
+    # TODO: Allow picking this
+    $VERB export BSDINSTALL_DISTSITE="$DISTSITE_STABLE"
+    $VERB export DISTRIBUTIONS="kernel.txz base.txz"
+    $VERB mkdir -p "$BSDINSTALL_DISTDIR"
+    $VERB bsdinstall distfetch
+    $VERB bsdinstall checksum
+    $VERB bsdinstall distextract
+    $VERB bsdinstall entropy
+    if [ "$INTERACTIVE" == "yes" ]; then
+      $VERB bsdinstall hostname
+      $VERB bsdinstall adduser
+      $VERB bsdinstall time
+      $VERB bsdinstall services
+      $VERB bsdinstall config
+    fi
+  )
+}
+
+do_final_adjustments() {
+  # setup boot environment
+  $verb zpool set bootfs=$ZPOOL/ROOT/default $ZPOOL
+
+  echo 'echo opensolaris_load="YES"	>> $WORK_ROOT/boot/loader.conf'
+  #echo 'echo cryptodev_load="YES"	>> $WORK_ROOT/boot/loader.conf'
+  echo 'echo zfs_load="YES"		>> $WORK_ROOT/boot/loader.conf'
+  echo 'echo geom_label_load="YES"	>> $WORK_ROOT/boot/loader.conf'
+
+  if [ "$DRY_RUN" != "yes" ]; then
+    echo 'opensolaris_load="YES"'	>> $WORK_ROOT/boot/loader.conf
+    #echo 'cryptodev_load="YES"'	>> $WORK_ROOT/boot/loader.conf
+    echo 'zfs_load="YES"'		>> $WORK_ROOT/boot/loader.conf
+
+    # Make sure we can find our MSDOSBOOT labelledpartition
+    echo 'geom_label_load="YES"'	>> $WORK_ROOT/boot/loader.conf
+
+    # Also fix umodem.ko
+    echo 'ucom_load="YES"'		>> $WORK_ROOT/boot/loader.conf
+    echo 'usb_load="YES"'		>> $WORK_ROOT/boot/loader.conf
+
+    # Set our boot filesystem override (system was compiled to boot from UFS)
+    echo "vfs.root.mountfrom=\"zfs:$ZPOOL/ROOT/default\""	>> $WORK_ROOT/boot/loader.conf
+  fi
+
+  # Enable the menu (disabled by default on RPi for some reason)
+  # $verb sed -i '' \
+  #   -e '/Disable the beastie menu/d' \
+  #   -e '/beastie_disable="YES"/d'    \
+  #   $WORK_ROOT/boot/loader.conf
+
+  # Fix fstab:
+  #  Remove the UFS partition line
+  #  Make mdsosfs partition noauto (right now we need to issue a glabel refresh <partition> to make it show up)
+  #$verb sed -i '' -e '/ufs/d' -e 's/noatime/noatime,noauto/' $WORK_ROOT/etc/fstab
+
+  # Don't change any default rc.conf. Use the .local variant
+  $verb sysrc -f $WORK_ROOT/etc/rc.conf.local zfs_enable="YES"
+  if [ "$SET_HOSTNAME" == "yes" ]; then
+    $verb sysrc -f $WORK_ROOT/etc/rc.conf.local hostname="$HOSTNAME"
+  fi
+}
+
+while getopts 34H:ISfip:w:h flag; do
+  case "$flag" in
+    3) BOARD=rpi3 ;;
+    4) BOARD=rpi4 ;;
+    f) DRY_RUN=no VERB=run_with_echo ;;
+    H) HOSTNAME="$OPTARG" ;;
+    I) INTERACTIVE=yes ;;
+    S) SUDO=sudo ;;
+    i) CREATE_IMAGE=yes ;;
+    p) ZPOOL="$OPTARG" ;;
+    w) WORK_DIR="$OPTARG" ;;
+    h) usage ;;
+    ?) echo "error: invalid argument: $flag"; usage fail ;;
+  esac
+done
+shift $(( $OPTIND - 1 ))
+
+DST="$1"
+if [ -z "$DST" ]; then
+  echo error: missing destination
+  usage fail
+fi
+
+case "$BOARD" in
+  rpi3)
+    BOARD_URL="$RPI3_EFI_URL"
+    PARTITION_TYPE=mbr
+    FAT_TYPE=fat16
+    FAT_BITS=16
+    FAT_GREP=fat
+    FAT_LABEL=MSDOSBOOT
+    ;;
+  rpi4)
+    BOARD_URL="$RPI4_EFI_URL"
+    PARTITION_TYPE=gpt
+    FAT_TYPE=efi
+    FAT_BITS=32
+    FAT_GREP=efi
+    FAT_LABEL=efi
+    ;;
+  *)
+    echo "error: need to specify -3 or -4"
+    usage fail
+    ;;
+esac
+
+# Do this before cding into WORK_DIR
+if [ "$CREATE_IMAGE" == "yes" ]; then
+  if [ -e "$DST" ]; then
+    echo "error: \`${DST}' must not exist when creating images"
+    usage fail
+  fi
+
+  # default to 3GB
+  IMG_SIZE=$((3000000000))
+  # MD related stuff lifted from crochet
+  SIZE_DISPLAY="$(($IMG_SIZE / 1000000))MB"
+  echo "Creating a ${SIZE_DISPLAY} raw disk image in:"
+  echo "    $DST"
+  # Interesting ftruncate like
+  $VERB dd if=/dev/zero of=${DST} bs=1000000 seek=$(($IMG_SIZE / 1000000)) count=0 >/dev/null 2>&1
+  if [ "$DRY_RUN" == "no" ]; then
+    DISK_MD=`$SUDO mdconfig -a -t vnode -f ${DST} -x 63 -y 255`
+    CLEANUP_MD=yes
+  else
+    echo $SUDO mdconfig -a -t vnode -f ${DST} -x 63 -y 255
+    DISK_MD=ZZZ_FAKE_disk_md
+  fi
+  DST=${DISK_MD}
+fi
+
+# Adjust to have a full path
+mkdir -p "$WORK_DIR"
+WORK_DIR=$(realpath "$WORK_DIR")
+WORK_ROOT="$WORK_DIR/root"
+$VERB mkdir -p "$WORK_ROOT"
+
+BOARD_EFI_ZIP="$BOARD-efi.zip"
+$VERB cd "$WORK_DIR"
+
+echo Writing to ${DST}
+if [ "$VERB" != "echo" ]; then
+  read -p "Please double-check everything. Press ENTER to continue..." dummy
+fi
+
+if [ -e "$BOARD_EFI_ZIP" ]; then
+  FETCH_DASH_I="-i $BOARD_EFI_ZIP"
+fi
+pwd
+$VERB fetch $FETCH_DASH_I -o "$BOARD_EFI_ZIP" "$BOARD_URL"
+
+do_final_cleanup() {
+  if [ "$CLEANUP_UNMOUNT_EFI" == yes ]; then
+    $VERB $SUDO umount "$WORK_ROOT/boot/efi"
+  fi
+  if [ "$CLEANUP_ZFS_EXPORT" == yes ]; then
+    $VERB $SUDO zpool export "$ZPOOL"
+  fi
+  if [ "$CLEANUP_MD" == yes ]; then
+    $VERB $SUDO mdconfig -d -u ${DISK_MD}
+  fi
+}
+
+# TODO: More exits/signals?
+trap do_final_cleanup EXIT
+
+if [ "${CREATE_IMAGE}" != "yes" ]; then
+  do_cleanup
+fi
+do_partitioning
+do_mkfs
+do_mount
+do_install
+do_final_adjustments
