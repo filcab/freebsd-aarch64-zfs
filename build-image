@@ -165,13 +165,14 @@ do_mkfs() {
 do_mount() {
   if [ "$DRY_RUN" == "no" ]; then
     $VERB $SUDO mount -t zfs $ZPOOL/ROOT/default "$WORK_ROOT"
-    $VERB mkdir -p "$WORK_ROOT/boot/efi"
-    $VERB $SUDO mount -t msdosfs /dev/$PART_DST_BOOT "$WORK_ROOT/boot/efi"
+    $VERB mkdir -p "$WORK_EFI"
+    $VERB $SUDO mount -t msdosfs /dev/$PART_DST_BOOT "$WORK_EFI"
     CLEANUP_UNMOUNT_EFI=yes
   fi
 }
 
 do_install() {
+  $VERB unzip -d "$WORK_EFI"
   (
     $VERB export BSDINSTALL_CHROOT="$WORK_ROOT"
     $VERB export BSDINSTALL_DISTDIR="$WORK_DIR/dist"
@@ -233,6 +234,18 @@ do_final_adjustments() {
   $verb sysrc -f $WORK_ROOT/etc/rc.conf.local zfs_enable="YES"
   if [ "$SET_HOSTNAME" == "yes" ]; then
     $verb sysrc -f $WORK_ROOT/etc/rc.conf.local hostname="$HOSTNAME"
+  fi
+}
+
+do_final_cleanup() {
+  if [ "$CLEANUP_UNMOUNT_EFI" == yes ]; then
+    $VERB $SUDO umount "$WORK_EFI"
+  fi
+  if [ "$CLEANUP_ZFS_EXPORT" == yes ]; then
+    $VERB $SUDO zpool export "$ZPOOL"
+  fi
+  if [ "$CLEANUP_MD" == yes ]; then
+    $VERB $SUDO mdconfig -d -u ${DISK_MD}
   fi
 }
 
@@ -311,6 +324,7 @@ fi
 mkdir -p "$WORK_DIR"
 WORK_DIR=$(realpath "$WORK_DIR")
 WORK_ROOT="$WORK_DIR/root"
+WORK_EFI="$WORK_ROOT/boot/efi"
 $VERB mkdir -p "$WORK_ROOT"
 
 BOARD_EFI_ZIP="$BOARD-efi.zip"
@@ -326,18 +340,6 @@ if [ -e "$BOARD_EFI_ZIP" ]; then
 fi
 pwd
 $VERB fetch $FETCH_DASH_I -o "$BOARD_EFI_ZIP" "$BOARD_URL"
-
-do_final_cleanup() {
-  if [ "$CLEANUP_UNMOUNT_EFI" == yes ]; then
-    $VERB $SUDO umount "$WORK_ROOT/boot/efi"
-  fi
-  if [ "$CLEANUP_ZFS_EXPORT" == yes ]; then
-    $VERB $SUDO zpool export "$ZPOOL"
-  fi
-  if [ "$CLEANUP_MD" == yes ]; then
-    $VERB $SUDO mdconfig -d -u ${DISK_MD}
-  fi
-}
 
 # TODO: More exits/signals?
 trap do_final_cleanup EXIT
