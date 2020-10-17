@@ -175,7 +175,7 @@ do_install() {
   $VERB unzip -d "$WORK_EFI"
   (
     $VERB export BSDINSTALL_CHROOT="$WORK_ROOT"
-    $VERB export BSDINSTALL_DISTDIR="$WORK_DIR/dist"
+    $VERB export BSDINSTALL_DISTDIR="$WORK_DIST"
     # TODO: Allow picking this
     $VERB export BSDINSTALL_DISTSITE="$DISTSITE_STABLE"
     $VERB export DISTRIBUTIONS="kernel.txz base.txz"
@@ -198,32 +198,33 @@ do_final_adjustments() {
   # setup boot environment
   $verb zpool set bootfs=$ZPOOL/ROOT/default $ZPOOL
 
-  echo 'echo opensolaris_load="YES"	>> $WORK_ROOT/boot/loader.conf'
-  #echo 'echo cryptodev_load="YES"	>> $WORK_ROOT/boot/loader.conf'
-  echo 'echo zfs_load="YES"		>> $WORK_ROOT/boot/loader.conf'
-  echo 'echo geom_label_load="YES"	>> $WORK_ROOT/boot/loader.conf'
+  local LOADER_CONF="$WORK_ROOT/boot/loader.conf"
+  echo 'echo opensolaris_load="YES"	>> $LOADER_CONF'
+  #echo 'echo cryptodev_load="YES"	>> $LOADER_CONF'
+  echo 'echo zfs_load="YES"		>> $LOADER_CONF'
+  echo 'echo geom_label_load="YES"	>> $LOADER_CONF'
 
   if [ "$DRY_RUN" != "yes" ]; then
-    echo 'opensolaris_load="YES"'	>> $WORK_ROOT/boot/loader.conf
-    #echo 'cryptodev_load="YES"'	>> $WORK_ROOT/boot/loader.conf
-    echo 'zfs_load="YES"'		>> $WORK_ROOT/boot/loader.conf
+    echo 'opensolaris_load="YES"'	>> "$LOADER_CONF"
+    #echo 'cryptodev_load="YES"'	>> "$LOADER_CONF"
+    echo 'zfs_load="YES"'		>> "$LOADER_CONF"
 
     # Make sure we can find our MSDOSBOOT labelledpartition
-    echo 'geom_label_load="YES"'	>> $WORK_ROOT/boot/loader.conf
+    echo 'geom_label_load="YES"'	>> "$LOADER_CONF"
 
     # Also fix umodem.ko
-    echo 'ucom_load="YES"'		>> $WORK_ROOT/boot/loader.conf
-    echo 'usb_load="YES"'		>> $WORK_ROOT/boot/loader.conf
+    echo 'ucom_load="YES"'		>> "$LOADER_CONF"
+    echo 'usb_load="YES"'		>> "$LOADER_CONF"
 
     # Set our boot filesystem override (system was compiled to boot from UFS)
-    echo "vfs.root.mountfrom=\"zfs:$ZPOOL/ROOT/default\""	>> $WORK_ROOT/boot/loader.conf
+    echo "vfs.root.mountfrom=\"zfs:$ZPOOL/ROOT/default\""	>> "$LOADER_CONF"
   fi
 
   # Enable the menu (disabled by default on RPi for some reason)
   # $verb sed -i '' \
   #   -e '/Disable the beastie menu/d' \
   #   -e '/beastie_disable="YES"/d'    \
-  #   $WORK_ROOT/boot/loader.conf
+  #   "$LOADER_CONF"
 
   # Fix fstab:
   #  Remove the UFS partition line
@@ -323,6 +324,7 @@ fi
 # Adjust to have a full path
 mkdir -p "$WORK_DIR"
 WORK_DIR=$(realpath "$WORK_DIR")
+WORK_DIST="$WORK_DIR/dist"
 WORK_ROOT="$WORK_DIR/root"
 WORK_EFI="$WORK_ROOT/boot/efi"
 $VERB mkdir -p "$WORK_ROOT"
