@@ -231,10 +231,11 @@ do_final_adjustments() {
   #  Make mdsosfs partition noauto (right now we need to issue a glabel refresh <partition> to make it show up)
   #$VERB sed -i '' -e '/ufs/d' -e 's/noatime/noatime,noauto/' $WORK_ROOT/etc/fstab
 
-  # Don't change any default rc.conf. Use the .local variant
-  $verb sysrc -f $WORK_ROOT/etc/rc.conf.local zfs_enable="YES"
+  # Change the default rc.conf, as we're setting up a "system".
+  # Let the user of the image control the .local variant
+  $VERB sysrc -f "$WORK_ROOT/etc/rc.conf" zfs_enable="YES"
   if [ "$SET_HOSTNAME" == "yes" ]; then
-    $verb sysrc -f $WORK_ROOT/etc/rc.conf.local hostname="$HOSTNAME"
+    $VERB sysrc -f "$WORK_ROOT/etc/rc.conf" hostname="$HOSTNAME"
   fi
 }
 
