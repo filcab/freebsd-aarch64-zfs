@@ -174,22 +174,33 @@ do_mount() {
 do_install() {
   $VERB unzip -d "$WORK_EFI" "$BOARD_EFI_ZIP"
   (
-    $VERB export BSDINSTALL_CHROOT="$WORK_ROOT"
-    $VERB export BSDINSTALL_DISTDIR="$WORK_DIST"
-    # TODO: Allow picking this
-    $VERB export BSDINSTALL_DISTSITE="$DISTSITE_STABLE"
-    $VERB export DISTRIBUTIONS="kernel.txz base.txz"
-    $VERB mkdir -p "$BSDINSTALL_DISTDIR"
-    $VERB bsdinstall distfetch
     $VERB bsdinstall checksum
     $VERB bsdinstall distextract
     $VERB bsdinstall entropy
     if [ "$INTERACTIVE" == "yes" ]; then
       $VERB bsdinstall hostname
-      $VERB bsdinstall adduser
       $VERB bsdinstall time
       $VERB bsdinstall services
       $VERB bsdinstall config
+
+      # Necessary for rootpass and adduser as they chroot into the install root
+      $VERB $SUDO mount -t nullfs /bin "$WORK_ROOT/bin"
+      $VERB $SUDO mount -t nullfs /lib "$WORK_ROOT/lib"
+      $VERB $SUDO mount -t nullfs /libexec "$WORK_ROOT/libexec"
+      $VERB $SUDO mount -t nullfs /usr/bin "$WORK_ROOT/usr/bin"
+      $VERB $SUDO mount -t nullfs /usr/lib "$WORK_ROOT/usr/lib"
+      $VERB $SUDO mount -t nullfs /usr/sbin "$WORK_ROOT/usr/sbin"
+
+      # Do this at the end so we don't mistakenly change anything for the ones above
+      $VERB bsdinstall rootpass
+      $VERB bsdinstall adduser
+
+      $VERB $SUDO umount "$WORK_ROOT/bin"
+      $VERB $SUDO umount "$WORK_ROOT/lib"
+      $VERB $SUDO umount "$WORK_ROOT/libexec"
+      $VERB $SUDO umount "$WORK_ROOT/usr/bin"
+      $VERB $SUDO umount "$WORK_ROOT/usr/lib"
+      $VERB $SUDO umount "$WORK_ROOT/usr/sbin"
     fi
   )
 }
@@ -297,59 +308,75 @@ case "$BOARD" in
     ;;
 esac
 
-# Do this before cding into WORK_DIR
-if [ "$CREATE_IMAGE" == "yes" ]; then
-  if [ -e "$DST" ]; then
-    echo "error: \`${DST}' must not exist when creating images"
-    usage fail
+do_init() {
+  # Do this before cding into WORK_DIR
+  if [ "$CREATE_IMAGE" == "yes" ]; then
+    if [ -e "$DST" ]; then
+      echo "error: \`${DST}' must not exist when creating images"
+      usage fail
+    fi
+  
+    # default to 3GB
+    IMG_SIZE=$((3000000000))
+    # MD related stuff lifted from crochet
+    SIZE_DISPLAY="$(($IMG_SIZE / 1000000))MB"
+    echo "Creating a ${SIZE_DISPLAY} raw disk image in:"
+    echo "    $DST"
+    # Interesting ftruncate like
+    $VERB dd if=/dev/zero of=${DST} bs=1000000 seek=$(($IMG_SIZE / 1000000)) count=0 >/dev/null 2>&1
+    if [ "$DRY_RUN" == "no" ]; then
+      DISK_MD=`$SUDO mdconfig -a -t vnode -f ${DST} -x 63 -y 255`
+      CLEANUP_MD=yes
+    else
+      echo $SUDO mdconfig -a -t vnode -f ${DST} -x 63 -y 255
+      DISK_MD=ZZZ_FAKE_disk_md
+    fi
+    DST=${DISK_MD}
   fi
 
-  # default to 3GB
-  IMG_SIZE=$((3000000000))
-  # MD related stuff lifted from crochet
-  SIZE_DISPLAY="$(($IMG_SIZE / 1000000))MB"
-  echo "Creating a ${SIZE_DISPLAY} raw disk image in:"
-  echo "    $DST"
-  # Interesting ftruncate like
-  $VERB dd if=/dev/zero of=${DST} bs=1000000 seek=$(($IMG_SIZE / 1000000)) count=0 >/dev/null 2>&1
-  if [ "$DRY_RUN" == "no" ]; then
-    DISK_MD=`$SUDO mdconfig -a -t vnode -f ${DST} -x 63 -y 255`
-    CLEANUP_MD=yes
-  else
-    echo $SUDO mdconfig -a -t vnode -f ${DST} -x 63 -y 255
-    DISK_MD=ZZZ_FAKE_disk_md
+  # Adjust to have a full path
+  mkdir -p "$WORK_DIR"
+  WORK_DIR=$(realpath "$WORK_DIR")
+  WORK_DIST="$WORK_DIR/dist"
+  WORK_ROOT="$WORK_DIR/root"
+  WORK_EFI="$WORK_ROOT/boot/efi"
+  $VERB mkdir -p "$WORK_ROOT"
+  
+  BOARD_EFI_ZIP="$BOARD-efi.zip"
+  
+  echo Writing to ${DST}
+  if [ "$VERB" != "echo" ]; then
+    read -p "Please double-check everything. Press ENTER to continue..." dummy
   fi
-  DST=${DISK_MD}
-fi
 
-# Adjust to have a full path
-mkdir -p "$WORK_DIR"
-WORK_DIR=$(realpath "$WORK_DIR")
-WORK_DIST="$WORK_DIR/dist"
-WORK_ROOT="$WORK_DIR/root"
-WORK_EFI="$WORK_ROOT/boot/efi"
-$VERB mkdir -p "$WORK_ROOT"
+  # These need exporting as they need to be propagated to subprocesses like bsdinstall
+  $VERB export BSDINSTALL_CHROOT="$WORK_ROOT"
+  $VERB export BSDINSTALL_DISTDIR="$WORK_DIST"
+  # TODO: Allow picking these
+  $VERB export BSDINSTALL_DISTSITE="$DISTSITE_STABLE"
+  $VERB export DISTRIBUTIONS="kernel.txz base.txz"
+  $VERB mkdir -p "$BSDINSTALL_DISTDIR"
+}
 
-BOARD_EFI_ZIP="$BOARD-efi.zip"
-$VERB cd "$WORK_DIR"
-
-echo Writing to ${DST}
-if [ "$VERB" != "echo" ]; then
-  read -p "Please double-check everything. Press ENTER to continue..." dummy
-fi
-
-if [ -e "$BOARD_EFI_ZIP" ]; then
-  FETCH_DASH_I="-i $BOARD_EFI_ZIP"
-fi
-pwd
-$VERB fetch $FETCH_DASH_I -o "$BOARD_EFI_ZIP" "$BOARD_URL"
-
-# TODO: More exits/signals?
-trap do_final_cleanup EXIT
+do_fetch() {
+  if [ -e "$BOARD_EFI_ZIP" ]; then
+    FETCH_DASH_I="-i $BOARD_EFI_ZIP"
+  fi
+  pwd
+  $VERB fetch $FETCH_DASH_I -o "$BOARD_EFI_ZIP" "$BOARD_URL"
+  $VERB bsdinstall distfetch
+}
 
 if [ "${CREATE_IMAGE}" != "yes" ]; then
   do_cleanup
 fi
+do_init
+
+# TODO: More exits/signals?
+trap do_final_cleanup EXIT
+
+$VERB cd "$WORK_DIR"
+do_fetch
 do_partitioning
 do_mkfs
 do_mount
