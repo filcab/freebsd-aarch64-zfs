@@ -196,7 +196,7 @@ do_install() {
 
 do_final_adjustments() {
   # setup boot environment
-  $verb zpool set bootfs=$ZPOOL/ROOT/default $ZPOOL
+  $VERB $SUDO zpool set bootfs="$ZPOOL/ROOT/default" $ZPOOL
 
   local LOADER_CONF="$WORK_ROOT/boot/loader.conf"
   echo 'echo opensolaris_load="YES"	>> $LOADER_CONF'
@@ -221,7 +221,7 @@ do_final_adjustments() {
   fi
 
   # Enable the menu (disabled by default on RPi for some reason)
-  # $verb sed -i '' \
+  # $VERB sed -i '' \
   #   -e '/Disable the beastie menu/d' \
   #   -e '/beastie_disable="YES"/d'    \
   #   "$LOADER_CONF"
@@ -229,7 +229,7 @@ do_final_adjustments() {
   # Fix fstab:
   #  Remove the UFS partition line
   #  Make mdsosfs partition noauto (right now we need to issue a glabel refresh <partition> to make it show up)
-  #$verb sed -i '' -e '/ufs/d' -e 's/noatime/noatime,noauto/' $WORK_ROOT/etc/fstab
+  #$VERB sed -i '' -e '/ufs/d' -e 's/noatime/noatime,noauto/' $WORK_ROOT/etc/fstab
 
   # Don't change any default rc.conf. Use the .local variant
   $verb sysrc -f $WORK_ROOT/etc/rc.conf.local zfs_enable="YES"
