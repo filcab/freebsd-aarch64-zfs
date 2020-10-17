@@ -172,7 +172,7 @@ do_mount() {
 }
 
 do_install() {
-  $VERB unzip -d "$WORK_EFI"
+  $VERB unzip -d "$WORK_EFI" "$BOARD_EFI_ZIP"
   (
     $VERB export BSDINSTALL_CHROOT="$WORK_ROOT"
     $VERB export BSDINSTALL_DISTDIR="$WORK_DIST"
