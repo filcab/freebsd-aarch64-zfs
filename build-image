@@ -2,9 +2,14 @@
 
 set -e
 
-DISTSITE_STABLE="https://download.freebsd.org/ftp/releases/arm64/aarch64/12.1-RELEASE/"
-DISTSITE_TESTING="https://download.freebsd.org/ftp/releases/arm64/aarch64/12.2-PRERELEASE/"
-DISTSITE_CURRENT="https://download.freebsd.org/ftp/releases/arm64/aarch64/13.0-CURRENT"
+RELEASE="12.1-RELEASE"
+#RELEASE="12.2-RC2"
+# FIXME: PRERELEASE and CURRENT require a different base URL (within snapshots)
+#RELEASE="12.2-PRERELEASE"
+#RELEASE="13.0-CURRENT"
+DISTSITE_URL="https://download.freebsd.org/ftp/releases/arm64"
+# Will be used if we're looking at -PRERELEASE or -CURRENT
+DISTSITE_SNAPSHOTS_URL="https://download.freebsd.org/ftp/snapshots/arm64"
 
 # defaults for CLI options
 BOARD=
@@ -41,9 +46,11 @@ usage() {
   echo "  -H NAME	Set hostname to NAME in rc.conf.local"
   echo "  -I		Ask additional questions interactively (hostname, users, time, services)"
   echo "  -S		Use \`sudo' with commands that are likely to require it"
+  echo "  -U URL	Use URL as the distsite base URL"
   echo "  -f		Actually run the commands (default is to just echo)"
   echo "  -i		Create an image file at destination"
-  echo "  -p NAME   Use NAME as the zpool name (defaults to $ZPOOL)"
+  echo "  -p NAME   	Use NAME as the zpool name (defaults to $ZPOOL)"
+  echo "  -r RELEASE	Use RELEASE as the release to fetch (defaults to $RELEASE)"
   echo "  -w WORK	Use WORK as a work directory (defaults to $WORK_DIR)"
   if [ ! -z "$1" ]; then
     exit 1
@@ -262,7 +269,7 @@ do_final_cleanup() {
   fi
 }
 
-while getopts 34H:ISfip:w:h flag; do
+while getopts 34H:ISU:fir:p:w:h flag; do
   case "$flag" in
     3) BOARD=rpi3 ;;
     4) BOARD=rpi4 ;;
@@ -270,7 +277,9 @@ while getopts 34H:ISfip:w:h flag; do
     H) HOSTNAME="$OPTARG" ;;
     I) INTERACTIVE=yes ;;
     S) SUDO=sudo ;;
+    U) DISTSITE_URL="$OPTARG" ;;
     i) CREATE_IMAGE=yes ;;
+    r) RELEASE="$OPTARG" ;;
     p) ZPOOL="$OPTARG" ;;
     w) WORK_DIR="$OPTARG" ;;
     h) usage ;;
@@ -353,7 +362,14 @@ do_init() {
   $VERB export BSDINSTALL_CHROOT="$WORK_ROOT"
   $VERB export BSDINSTALL_DISTDIR="$WORK_DIST"
   # TODO: Allow picking these
-  $VERB export BSDINSTALL_DISTSITE="$DISTSITE_STABLE"
+  case "$RELEASE" in
+    *PRERELEASE|*CURRENT)
+      $VERB export BSDINSTALL_DISTSITE="$DISTSITE_SNAPSHOTS_URL/$RELEASE"
+      ;;
+    *)
+      $VERB export BSDINSTALL_DISTSITE="$DISTSITE_URL/$RELEASE"
+      ;;
+  esac
   $VERB export DISTRIBUTIONS="kernel.txz base.txz"
   $VERB mkdir -p "$BSDINSTALL_DISTDIR"
 }
