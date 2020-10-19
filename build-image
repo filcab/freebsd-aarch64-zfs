@@ -45,6 +45,7 @@ usage() {
   echo "Other options"
   echo "  -H NAME	Set hostname to NAME in rc.conf.local"
   echo "  -I		Ask additional questions interactively (hostname, users, time, services)"
+  echo "  -L		Leave the partitions mounted and the md attached at the end of the script"
   echo "  -S		Use \`sudo' with commands that are likely to require it"
   echo "  -U URL	Use URL as the distsite base URL"
   echo "  -f		Actually run the commands (default is to just echo)"
@@ -258,6 +259,10 @@ do_final_adjustments() {
 }
 
 do_final_cleanup() {
+  if [ "$LEAVE_MOUNTED" == yes ]; then
+    return
+  fi
+
   if [ "$CLEANUP_UNMOUNT_EFI" == yes ]; then
     $VERB $SUDO umount "$WORK_EFI"
   fi
@@ -269,13 +274,14 @@ do_final_cleanup() {
   fi
 }
 
-while getopts 34H:ISU:fir:p:w:h flag; do
+while getopts 34H:ILSU:fir:p:w:h flag; do
   case "$flag" in
     3) BOARD=rpi3 ;;
     4) BOARD=rpi4 ;;
     f) DRY_RUN=no VERB=run_with_echo ;;
     H) HOSTNAME="$OPTARG" ;;
     I) INTERACTIVE=yes ;;
+    L) LEAVE_MOUNTED=yes ;;
     S) SUDO=sudo ;;
     U) DISTSITE_URL="$OPTARG" ;;
     i) CREATE_IMAGE=yes ;;
