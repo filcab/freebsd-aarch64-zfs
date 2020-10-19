@@ -211,6 +211,13 @@ do_install() {
       $VERB $SUDO umount "$WORK_ROOT/usr/sbin"
     fi
   )
+  $VERB mkdir -p "$WORK_EFI/Boot"
+  # Install the actual bootloader as the default boot
+  # TODO: Maybe just install it in a FreeBSD directory?
+  # TODO: Check if the EFI impl will search for it
+  $VERB cp "$WORK_ROOT"/boot/boot1.efi "$WORK_EFI/Boot/bootaa64.efi"
+
+  # TODO: Maybe disable beastie and colours
 }
 
 do_final_adjustments() {
